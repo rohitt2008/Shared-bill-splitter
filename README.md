@@ -155,3 +155,24 @@ You must understand every line you submit. We check this with your video and in 
 5. Paste the repository link and the video link in the application form.
 
 We will run `pnpm install && pnpm check && pnpm typecheck && pnpm test` on your repository.
+
+## Decisions
+
+### 1. Atomic Concurrency and Idempotency at the Database Layer
+
+- **Decision:** Enforce payment idempotency and race condition prevention directly using atomic SQLite statements (`UPDATE shares SET paid_at = ?, idempotency_key = ? WHERE id = ? AND bill_id = ? AND paid_at IS NULL`) rather than in-memory locks or distributed locks.
+- **Why:** Cloudflare Workers run across distributed edge isolates without shared application memory. In-memory locks fail when concurrent requests hit different edge nodes. By using SQLite's atomic row update with a `paid_at IS NULL` guard, the database guarantees that exactly one request transitions the share from unpaid to paid. Competing requests see zero rows modified (`changes === 0`), inspect the share record, and safely return HTTP 200 if the same `Idempotency-Key` was provided, or HTTP 409 Conflict if a different key was used.
+
+### 2. Deterministic Integer Math & Addition-Order Remainder Distribution
+
+- **Decision:** Store all monetary amounts strictly as integer cents (`total_cents` and `amount_cents`), rejecting any floats/decimals. When splitting a bill, divide using integer floor (`Math.floor(totalCents / N)`) and distribute the remainder cents one-by-one to members strictly ordered by addition (`ORDER BY rowid ASC`).
+- **Why:** Floating-point arithmetic introduces IEEE 754 precision inaccuracies (e.g. `0.1 + 0.2 !== 0.3`). Whole integer cents guarantee exact sums without rounding drift. Distributing the remainder cents (`totalCents % N`) to members in their exact addition order ensures deterministic outcomes, guarantees that `sum(shares) === totalCents` even when `totalCents < N`, and satisfies the requirement that early-joined members take the initial extra cents.
+
+### 3. Defense-in-Depth Data Integrity via Named Schema Constraints
+
+- **Decision:** Define explicit named constraints in the SQLite schema migration (`api/migrations/0001_init.sql`):
+  - `CONSTRAINT fk_members_home` and `CONSTRAINT fk_bills_home`: Foreign keys enforcing referential integrity and stopping orphaned member/bill rows.
+  - `CONSTRAINT chk_bills_total_cents_positive CHECK (total_cents > 0)` and `CONSTRAINT chk_shares_amount_cents_nonnegative CHECK (amount_cents >= 0)`: Database-level checks stopping invalid non-positive or corrupted amounts.
+  - `CONSTRAINT uq_shares_bill_member UNIQUE (bill_id, member_id)`: Unique constraint stopping duplicate share assignments where a member is assigned multiple shares for the same bill.
+  - `CONSTRAINT chk_members_name_nonempty CHECK (length(trim(name)) > 0)`: Check constraint stopping blank or whitespace-only names.
+- **Why:** Application-level validation can be bypassed by migrations, direct queries, or future code modifications. Named schema constraints provide a firm defense-in-depth boundary, stopping data corruption at the storage layer while giving clear diagnostic names if violated.
